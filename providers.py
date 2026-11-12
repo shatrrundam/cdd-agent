@@ -39,6 +39,7 @@ class GeminiProvider:
         self.candidates = self._candidate_models(model or self.default_model)
         self.model = self.candidates[0]
         self.tried = []  # models dropped because they had no free quota
+        self.log = []    # why each model was dropped, for a useful error message
 
     def _candidate_models(self, wanted: str) -> list[str]:
         """Google renames, retires and paywalls models often. Build an ordered list of Flash models this key
@@ -113,14 +114,29 @@ class GeminiProvider:
                 # anything else (no free allowance, daily cap, retired model, unknown quota):
                 # each model has its own quota, so move to the next one
                 waits = 0
+                self.log.append(f"{self.model}: {code} {', '.join(q.get('ids') or []) or q['msg'][:90]}")
                 if self._next_model():
                     continue
-                code, q = last
-                hint = (" The Google Search quota appears to be the limit." if q.get("search") else "")
-                raise RuntimeError(
-                    f"No Gemini model with free quota worked for this key (tried {', '.join(self.tried)}). "
-                    f"Last error {code}: {q['msg']} Quota: {', '.join(q['ids']) or 'not stated'}.{hint} "
-                    f"Check per-model free limits at https://ai.dev/rate-limit") from e
+                raise RuntimeError(self._diagnose(config)) from e
+
+    def _diagnose(self, config) -> str:
+        """Every model failed. Find out whether plain calls work and only Google Search is blocked."""
+        uses_search = bool(getattr(config, "tools", None))
+        verdict = ""
+        if uses_search:
+            for m in self.candidates:
+                try:
+                    self.client.models.generate_content(model=m, contents="Reply with OK.",
+                                                        config=self.types.GenerateContentConfig(max_output_tokens=5))
+                    verdict = (f"DIAGNOSIS: plain requests work on {m}, but requests with Google Search are refused. "
+                               "This key's project has no free Google Search grounding allowance. ")
+                    break
+                except Exception:
+                    continue
+            if not verdict:
+                verdict = ("DIAGNOSIS: even plain requests without Google Search are refused on every model, so this "
+                           "project has no usable free quota at all (often a new project, or one linked to billing). ")
+        return verdict + "Per model: " + " | ".join(self.log) + ". Check https://ai.dev/rate-limit"
 
     def research(self, system, user, max_searches):
         t = self.types
