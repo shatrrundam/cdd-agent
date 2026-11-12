@@ -36,11 +36,13 @@ class GeminiProvider:
         from google.genai import types
         self.types = types
         self.client = genai.Client(api_key=api_key)
-        self.model = self._resolve_model(model or self.default_model)
+        self.candidates = self._candidate_models(model or self.default_model)
+        self.model = self.candidates[0]
+        self.tried = []  # models dropped because they had no free quota
 
-    def _resolve_model(self, wanted: str) -> str:
-        """Google renames and retires model IDs often. If the requested one is not available to this key,
-        pick the newest general-purpose Flash model the key can use."""
+    def _candidate_models(self, wanted: str) -> list[str]:
+        """Google renames, retires and paywalls models often. Build an ordered list of Flash models this key
+        can call: the requested one first (if available), then stable Flash models, then previews, then lite."""
         try:
             available = []
             for m in self.client.models.list():
@@ -50,34 +52,51 @@ class GeminiProvider:
                     continue
                 available.append(name)
         except Exception:
-            return wanted  # cannot list models; try the requested one as is
-        if wanted in available:
-            return wanted
-        skip = ("lite", "image", "tts", "audio", "live", "embedding", "thinking", "exp", "8b", "robotics")
+            return [wanted]  # cannot list models; try the requested one as is
+        skip = ("image", "tts", "audio", "live", "embedding", "thinking", "exp", "8b", "robotics", "native")
         flash = [n for n in available if "flash" in n and not any(s in n for s in skip)]
-        if not flash:
-            return wanted
 
         def rank(n):
             ver = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
             v = float(ver.group(1)) if ver else 0.0
-            # newest version first; within a version prefer stable over preview, alias "latest" last resort
-            return (v, "preview" not in n, "latest" not in n)
-        return sorted(flash, key=rank, reverse=True)[0]
+            # full Flash before lite, stable before preview, newest version first, aliases last
+            return ("lite" not in n, "preview" not in n, "latest" not in n, v)
+        ordered = sorted(flash, key=rank, reverse=True)
+        out = ([wanted] if wanted in available else []) + [n for n in ordered if n != wanted]
+        return out or [wanted]
+
+    @staticmethod
+    def _short(e) -> str:
+        msg = str(getattr(e, "message", "") or e)
+        return msg[:400]
 
     def _call(self, contents, config):
         from google.genai import errors
-        for attempt in range(5):
+        waits = 0
+        while True:
             try:
                 return self.client.models.generate_content(model=self.model, contents=contents, config=config)
             except errors.APIError as e:
-                code = getattr(e, "code", 0)
-                if code in (429, 500, 503) and attempt < 4:
-                    time.sleep(20 * (attempt + 1))  # free tier: wait out the per-minute window
+                code, msg = getattr(e, "code", 0), self._short(e)
+                low = msg.lower()
+                no_free_quota = "limit: 0" in low or "limit:0" in low
+                daily = "perday" in low.replace(" ", "") or "per day" in low
+                # this model has no free allowance, its daily allowance is used up, or it was retired:
+                # move to the next candidate model, each has its own quota
+                if (code == 429 and (no_free_quota or daily)) or code == 404:
+                    self.tried.append(self.model)
+                    rest = [m for m in self.candidates if m not in self.tried]
+                    if rest:
+                        self.model = rest[0]
+                        continue
+                    raise RuntimeError(f"No Gemini model with free quota is available to this key "
+                                       f"(tried {', '.join(self.tried)}). Google said: {msg}") from e
+                # per-minute limit or a temporary outage: wait and retry
+                if code in (429, 500, 503) and waits < 4:
+                    waits += 1
+                    time.sleep(20 * waits)
                     continue
-                if code == 429:
-                    raise RuntimeError("Gemini free tier quota reached. Try again later or tomorrow.") from e
-                raise
+                raise RuntimeError(f"Gemini error {code} on {self.model}: {msg}") from e
 
     def research(self, system, user, max_searches):
         t = self.types
