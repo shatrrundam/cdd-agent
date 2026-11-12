@@ -10,6 +10,7 @@ Gemini (free tier) is the default. Claude is kept for higher quality runs.
 
 from __future__ import annotations
 
+import re
 import time
 from urllib.parse import urlparse
 
@@ -35,7 +36,34 @@ class GeminiProvider:
         from google.genai import types
         self.types = types
         self.client = genai.Client(api_key=api_key)
-        self.model = model or self.default_model
+        self.model = self._resolve_model(model or self.default_model)
+
+    def _resolve_model(self, wanted: str) -> str:
+        """Google renames and retires model IDs often. If the requested one is not available to this key,
+        pick the newest general-purpose Flash model the key can use."""
+        try:
+            available = []
+            for m in self.client.models.list():
+                name = (m.name or "").replace("models/", "")
+                actions = getattr(m, "supported_actions", None) or []
+                if actions and "generateContent" not in actions:
+                    continue
+                available.append(name)
+        except Exception:
+            return wanted  # cannot list models; try the requested one as is
+        if wanted in available:
+            return wanted
+        skip = ("lite", "image", "tts", "audio", "live", "embedding", "thinking", "exp", "8b", "robotics")
+        flash = [n for n in available if "flash" in n and not any(s in n for s in skip)]
+        if not flash:
+            return wanted
+
+        def rank(n):
+            ver = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+            v = float(ver.group(1)) if ver else 0.0
+            # newest version first; within a version prefer stable over preview, alias "latest" last resort
+            return (v, "preview" not in n, "latest" not in n)
+        return sorted(flash, key=rank, reverse=True)[0]
 
     def _call(self, contents, config):
         from google.genai import errors
