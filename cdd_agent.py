@@ -238,11 +238,14 @@ def _failed_section(k, err, model):
 def run_cdd(company: str, context: str = "", lens: str = "financial investor (PE fund)",
             notes: str = "", api_key: str | None = None, provider: str = DEFAULT_PROVIDER,
             model: str | None = None, parallel: bool | None = None, search_budget: int | None = None,
+            search_key: str | None = None,
             on_progress: Callable[[str, str], None] | None = None) -> dict:
     """Run the full CDD. on_progress(step, status) fires for each step in STEPS."""
     import os
     key = api_key or os.environ.get("GEMINI_API_KEY" if provider == "gemini" else "ANTHROPIC_API_KEY", "")
-    llm = make_provider(provider, key, model)
+    if provider == "gemini" and search_key is None:
+        search_key = os.environ.get("TAVILY_API_KEY") or None
+    llm = make_provider(provider, key, model, search_key)
     if parallel is None:
         parallel = llm.parallel_ok
     progress = on_progress or (lambda k, s: None)

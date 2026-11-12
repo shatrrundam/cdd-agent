@@ -75,10 +75,15 @@ with st.sidebar:
         help="Free Gemini key from aistudio.google.com. Stored only for this browser session.")
     default_model = secret("GEMINI_MODEL", GEMINI_DEFAULT_MODEL) if engine == "gemini" \
         else secret("CLAUDE_MODEL", CLAUDE_DEFAULT_MODEL)
+    search_key = None
+    if engine == "gemini":
+        search_key = secret("TAVILY_API_KEY") or st.text_input(
+            "Tavily API key (web search)", type="password",
+            help="Free at tavily.com, 1,000 searches a month. Needed if your Gemini project has no free Google Search.")
     model = st.text_input("Model", value=default_model)
     parallel = st.toggle("Run agents in parallel", value=(engine == "claude"),
                          help="Off by default on the free tier to stay inside per-minute limits.")
-    budget = st.slider("Max web searches per agent", 3, 15, 8)
+    budget = st.slider("Max web searches per agent", 3, 8, 6)
     st.caption("A run takes about 5 to 15 minutes.")
     if secret(key_name):
         st.caption(f"Runs left today on this demo: {max(0, runs_left())} of {DAILY_LIMIT}")
@@ -126,6 +131,7 @@ if run:
         try:
             box["result"] = run_cdd(company, context, lens, notes, api_key=api_key, provider=engine,
                                     model=model, parallel=parallel, search_budget=budget,
+                                    search_key=search_key or None,
                                     on_progress=lambda k, s: state.__setitem__(k, s))
         except Exception as e:
             box["error"] = str(e)

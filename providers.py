@@ -24,6 +24,54 @@ def domain(url_or_title: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+# ---------------------------------------------------------------- Tavily web search (free: 1,000 searches a month)
+
+def tavily_search(api_key: str, query: str, max_results: int = 5) -> list[dict]:
+    """One basic Tavily search (1 credit). Returns [{title, url, content}]; empty list on failure."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    body = _json.dumps({"query": query, "search_depth": "basic", "max_results": max_results,
+                        "chunks_per_source": 3, "include_answer": False}).encode()
+    req = urllib.request.Request("https://api.tavily.com/search", data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {api_key}",
+                                          "Content-Type": "application/json"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=40) as r:
+                data = _json.loads(r.read().decode())
+            return [{"title": x.get("title") or x.get("url"), "url": x.get("url"),
+                     "content": (x.get("content") or "")[:1500]} for x in data.get("results") or [] if x.get("url")]
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise RuntimeError("Tavily rejected the API key. Check TAVILY_API_KEY in Secrets.") from e
+            if e.code == 432 or e.code == 433:
+                raise RuntimeError("Tavily free monthly search credits are used up.") from e
+            time.sleep(5 * (attempt + 1))
+        except Exception:
+            time.sleep(5 * (attempt + 1))
+    return []
+
+
+PLAN_QUERIES = """You are planning web searches for a research task. Read the task and return the {n} most useful
+search queries as a JSON list of strings, nothing else. Each query under 12 words. Name the company in each
+query where relevant. Favour queries that surface primary sources: the latest annual report, investor
+presentation, earnings call transcript, stock exchange filings, regulator or industry body statistics, and
+listed peers' results. Cover different aspects of the task; do not repeat near-identical queries.
+
+TASK:
+{task}"""
+
+WITH_RESULTS = """{task}
+
+WEB SEARCH RESULTS (gathered for you just now; these are your only sources):
+{results}
+
+Use only the information above plus clearly stated general knowledge. Do not invent figures. Cite sources by
+their exact URL from the list above in the "sources" field. If the results do not cover something, say so
+and add it to data_gaps."""
+
+
 # ---------------------------------------------------------------- Gemini
 
 class GeminiProvider:
@@ -31,10 +79,14 @@ class GeminiProvider:
     default_model = GEMINI_DEFAULT_MODEL
     parallel_ok = False  # free tier per-minute limits are tight
 
-    def __init__(self, api_key: str, model: str | None = None):
+    def __init__(self, api_key: str, model: str | None = None, search_key: str | None = None):
         from google import genai
         from google.genai import types
         self.types = types
+        # With a Tavily key, Tavily does the searching and Gemini only reads and writes (works on projects
+        # with no free Google Search grounding). Without one, Gemini's built-in Google Search is used.
+        self.search_key = search_key
+        self.name = "Gemini + Tavily search (free tiers)" if search_key else "Gemini (free tier)"
         self.client = genai.Client(api_key=api_key)
         self.candidates = self._candidate_models(model or self.default_model)
         self.model = self.candidates[0]
@@ -139,6 +191,8 @@ class GeminiProvider:
         return verdict + "Per model: " + " | ".join(self.log) + ". Check https://ai.dev/rate-limit"
 
     def research(self, system, user, max_searches):
+        if self.search_key:
+            return self._research_tavily(system, user, max_searches)
         t = self.types
         user = user + f"\n\nUse Google Search as needed (aim for no more than about {max_searches} searches)."
         cfg = t.GenerateContentConfig(system_instruction=system, temperature=0.3,
@@ -157,6 +211,32 @@ class GeminiProvider:
                     # Gemini returns a Google redirect link; the title is the source's domain
                     searched[web.uri] = web.title or web.uri
         return text, searched, {}, n
+
+    def _research_tavily(self, system, user, max_searches):
+        """Plan queries with Gemini, run them on Tavily, then have Gemini write from the results."""
+        n = max(3, min(int(max_searches), 8))
+        plan = self.complete(f"{system}\n\n" + PLAN_QUERIES.format(n=n, task=user), max_tokens=1500)
+        m = re.search(r"\[.*\]", plan or "", flags=re.S)
+        try:
+            import json as _json
+            queries = [q for q in _json.loads(m.group(0)) if isinstance(q, str)][:n] if m else []
+        except Exception:
+            queries = []
+        if not queries:  # fall back to a simple query from the task's first line
+            queries = [re.sub(r"\s+", " ", user.split("\n")[0])[:120]]
+
+        searched, blocks, seen = {}, [], set()
+        for q in queries:
+            for r in tavily_search(self.search_key, q):
+                if r["url"] in seen:
+                    continue
+                seen.add(r["url"])
+                searched[r["url"]] = r["title"]
+                blocks.append(f"[{len(blocks) + 1}] {r['title']}\nURL: {r['url']}\n{r['content']}")
+        results = "\n\n".join(blocks)[:60000] or "No results were returned."
+        cfg = self.types.GenerateContentConfig(system_instruction=system, temperature=0.3, max_output_tokens=8192)
+        text = self._call(WITH_RESULTS.format(task=user, results=results), cfg).text or ""
+        return text, searched, {}, len(queries)
 
     def complete(self, prompt, max_tokens=8000):
         cfg = self.types.GenerateContentConfig(temperature=0.2, max_output_tokens=max_tokens)
@@ -219,5 +299,7 @@ class ClaudeProvider:
 PROVIDERS = {"gemini": GeminiProvider, "claude": ClaudeProvider}
 
 
-def make_provider(name: str, api_key: str, model: str | None = None):
+def make_provider(name: str, api_key: str, model: str | None = None, search_key: str | None = None):
+    if name == "gemini":
+        return GeminiProvider(api_key=api_key, model=model or None, search_key=search_key or None)
     return PROVIDERS[name](api_key=api_key, model=model or None)
