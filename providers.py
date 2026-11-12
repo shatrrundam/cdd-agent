@@ -66,37 +66,61 @@ class GeminiProvider:
         return out or [wanted]
 
     @staticmethod
-    def _short(e) -> str:
-        msg = str(getattr(e, "message", "") or e)
-        return msg[:400]
+    def _quota_info(e) -> dict:
+        """Read Google's structured quota details: which quota was hit, its value, and the retry delay."""
+        import json as _json
+        raw = _json.dumps(getattr(e, "details", None) or {}) + " " + str(getattr(e, "message", "") or e)
+        ids = re.findall(r'"quotaId":\s*"([^"]+)"', raw)
+        values = re.findall(r'"quotaValue":\s*"?(\d+)', raw)
+        delay = re.search(r'"retryDelay":\s*"(\d+)', raw)
+        low = raw.lower()
+        return {
+            "ids": ids,
+            "zero": any(v == "0" for v in values) or "limit: 0" in low,
+            "daily": any("perday" in i.lower() for i in ids),
+            "minute": any("perminute" in i.lower() for i in ids),
+            "search": any("search" in i.lower() or "grounding" in i.lower() for i in ids) or "grounding" in low,
+            "delay": int(delay.group(1)) if delay else 20,
+            "msg": str(getattr(e, "message", "") or e)[:300],
+        }
+
+    def _next_model(self) -> bool:
+        self.tried.append(self.model)
+        rest = [m for m in self.candidates if m not in self.tried]
+        if rest:
+            self.model = rest[0]
+            return True
+        return False
 
     def _call(self, contents, config):
         from google.genai import errors
-        waits = 0
+        waits, last = 0, None
         while True:
             try:
                 return self.client.models.generate_content(model=self.model, contents=contents, config=config)
             except errors.APIError as e:
-                code, msg = getattr(e, "code", 0), self._short(e)
-                low = msg.lower()
-                no_free_quota = "limit: 0" in low or "limit:0" in low
-                daily = "perday" in low.replace(" ", "") or "per day" in low
-                # this model has no free allowance, its daily allowance is used up, or it was retired:
-                # move to the next candidate model, each has its own quota
-                if (code == 429 and (no_free_quota or daily)) or code == 404:
-                    self.tried.append(self.model)
-                    rest = [m for m in self.candidates if m not in self.tried]
-                    if rest:
-                        self.model = rest[0]
-                        continue
-                    raise RuntimeError(f"No Gemini model with free quota is available to this key "
-                                       f"(tried {', '.join(self.tried)}). Google said: {msg}") from e
-                # per-minute limit or a temporary outage: wait and retry
-                if code in (429, 500, 503) and waits < 4:
+                code = getattr(e, "code", 0)
+                if code not in (404, 429, 500, 503):
+                    raise RuntimeError(f"Gemini error {code} on {self.model}: {str(e)[:300]}") from e
+                q = self._quota_info(e) if code == 429 else {"ids": [], "minute": False, "delay": 20,
+                                                              "msg": str(e)[:300]}
+                last = (code, q)
+                # short wait for a per-minute limit or a temporary outage, at most twice per model
+                if (q["minute"] and not q["zero"] or code in (500, 503)) and waits < 2:
                     waits += 1
-                    time.sleep(20 * waits)
+                    time.sleep(min(60, q["delay"] + 2))
                     continue
-                raise RuntimeError(f"Gemini error {code} on {self.model}: {msg}") from e
+                # anything else (no free allowance, daily cap, retired model, unknown quota):
+                # each model has its own quota, so move to the next one
+                waits = 0
+                if self._next_model():
+                    continue
+                code, q = last
+                hint = (" The Google Search quota appears to be the limit." if q.get("search") else "")
+                raise RuntimeError(
+                    f"No Gemini model with free quota worked for this key (tried {', '.join(self.tried)}). "
+                    f"Last error {code}: {q['msg']} Quota: {', '.join(q['ids']) or 'not stated'}.{hint} "
+                    f"Check per-model free limits at https://ai.dev/rate-limit") from e
 
     def research(self, system, user, max_searches):
         t = self.types
