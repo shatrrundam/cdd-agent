@@ -1,0 +1,136 @@
+"""Model providers. Each exposes the same two calls so the CDD pipeline does not care which one runs.
+
+    research(system, user, max_searches) -> (text, searched, cited, n_searches)
+        one web-grounded agent turn; searched/cited map url -> title
+    complete(prompt, max_tokens) -> text
+        plain call with no web access (editor, synthesis)
+
+Gemini (free tier) is the default. Claude is kept for higher quality runs.
+"""
+
+from __future__ import annotations
+
+import time
+from urllib.parse import urlparse
+
+GEMINI_DEFAULT_MODEL = "gemini-3-flash-preview"
+CLAUDE_DEFAULT_MODEL = "claude-sonnet-5-5"
+
+
+def domain(url_or_title: str) -> str:
+    s = (url_or_title or "").strip().lower()
+    host = urlparse(s).netloc if "://" in s else s.split("/")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+# ---------------------------------------------------------------- Gemini
+
+class GeminiProvider:
+    name = "Gemini (free tier)"
+    default_model = GEMINI_DEFAULT_MODEL
+    parallel_ok = False  # free tier per-minute limits are tight
+
+    def __init__(self, api_key: str, model: str | None = None):
+        from google import genai
+        from google.genai import types
+        self.types = types
+        self.client = genai.Client(api_key=api_key)
+        self.model = model or self.default_model
+
+    def _call(self, contents, config):
+        from google.genai import errors
+        for attempt in range(5):
+            try:
+                return self.client.models.generate_content(model=self.model, contents=contents, config=config)
+            except errors.APIError as e:
+                code = getattr(e, "code", 0)
+                if code in (429, 500, 503) and attempt < 4:
+                    time.sleep(20 * (attempt + 1))  # free tier: wait out the per-minute window
+                    continue
+                if code == 429:
+                    raise RuntimeError("Gemini free tier quota reached. Try again later or tomorrow.") from e
+                raise
+
+    def research(self, system, user, max_searches):
+        t = self.types
+        user = user + f"\n\nUse Google Search as needed (aim for no more than about {max_searches} searches)."
+        cfg = t.GenerateContentConfig(system_instruction=system, temperature=0.3,
+                                      tools=[t.Tool(google_search=t.GoogleSearch())])
+        resp = self._call(user, cfg)
+        text = resp.text or ""
+        searched, n = {}, 0
+        for cand in resp.candidates or []:
+            gm = getattr(cand, "grounding_metadata", None)
+            if not gm:
+                continue
+            n += len(gm.web_search_queries or [])
+            for ch in gm.grounding_chunks or []:
+                web = getattr(ch, "web", None)
+                if web and web.uri:
+                    # Gemini returns a Google redirect link; the title is the source's domain
+                    searched[web.uri] = web.title or web.uri
+        return text, searched, {}, n
+
+    def complete(self, prompt, max_tokens=8000):
+        cfg = self.types.GenerateContentConfig(temperature=0.2, max_output_tokens=max_tokens)
+        return self._call(prompt, cfg).text or ""
+
+
+# ---------------------------------------------------------------- Claude
+
+class ClaudeProvider:
+    name = "Claude (paid)"
+    default_model = CLAUDE_DEFAULT_MODEL
+    parallel_ok = True
+
+    def __init__(self, api_key: str, model: str | None = None):
+        import anthropic
+        self.anthropic = anthropic
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = model or self.default_model
+
+    def _call(self, **kwargs):
+        a = self.anthropic
+        for attempt in range(4):
+            try:
+                return self.client.messages.create(model=self.model, **kwargs)
+            except (a.RateLimitError, a.APIConnectionError, a.InternalServerError):
+                if attempt == 3:
+                    raise
+                time.sleep(15 * (attempt + 1))
+
+    def research(self, system, user, max_searches):
+        tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": max_searches}]
+        messages = [{"role": "user", "content": user}]
+        text, searched, cited, n = "", {}, {}, 0
+        for _ in range(6):  # follow pause_turn continuations on long searches
+            resp = self._call(max_tokens=8000, system=system, messages=messages, tools=tools)
+            for block in resp.content:
+                btype = getattr(block, "type", "")
+                if btype == "text":
+                    text += block.text
+                    for c in (getattr(block, "citations", None) or []):
+                        if getattr(c, "url", None):
+                            cited[c.url] = getattr(c, "title", None) or c.url
+                elif btype == "server_tool_use":
+                    n += 1
+                elif btype == "web_search_tool_result" and isinstance(getattr(block, "content", None), list):
+                    for r in block.content:
+                        if getattr(r, "url", None):
+                            searched[r.url] = getattr(r, "title", None) or r.url
+            if resp.stop_reason != "pause_turn":
+                break
+            messages = messages + [{"role": "assistant",
+                                    "content": [b.model_dump(exclude_none=True) for b in resp.content]}]
+        return text, searched, cited, n
+
+    def complete(self, prompt, max_tokens=8000):
+        resp = self._call(max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
+        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+
+
+PROVIDERS = {"gemini": GeminiProvider, "claude": ClaudeProvider}
+
+
+def make_provider(name: str, api_key: str, model: str | None = None):
+    return PROVIDERS[name](api_key=api_key, model=model or None)
